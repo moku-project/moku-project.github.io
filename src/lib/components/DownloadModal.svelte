@@ -12,11 +12,25 @@
 	const RELEASES_URL = `https://github.com/${REPO}/releases/latest`;
 
 	type Asset = { name: string; browser_download_url: string; size: number };
-	type Platform = 'windows' | 'macos-arm64' | 'macos-x64' | 'linux-appimage' | 'linux-flatpak';
+	type Platform =
+		| 'windows'
+		| 'windows-arm64'
+		| 'macos-arm64'
+		| 'macos-x64'
+		| 'linux-appimage'
+		| 'linux-appimage-arm64'
+		| 'linux-flatpak'
+		| 'linux-flatpak-arm64';
 	type OS = 'windows' | 'macos' | 'linux';
 
 	const PLATFORM_META: Record<Platform, { os: OS; label: string; detail: string; match: RegExp }> = {
 		windows: { os: 'windows', label: 'Windows', detail: 'x64 installer (.exe)', match: /_x64-setup\.exe$/i },
+		'windows-arm64': {
+			os: 'windows',
+			label: 'Windows',
+			detail: 'ARM64 installer (.exe)',
+			match: /_arm64-setup\.exe$/i
+		},
 		'macos-arm64': {
 			os: 'macos',
 			label: 'macOS',
@@ -24,9 +38,35 @@
 			match: /macos-arm64.*\.dmg$/i
 		},
 		'macos-x64': { os: 'macos', label: 'macOS', detail: 'Intel (.dmg)', match: /macos-x64.*\.dmg$/i },
-		'linux-appimage': { os: 'linux', label: 'Linux', detail: 'AppImage', match: /\.AppImage$/i },
-		'linux-flatpak': { os: 'linux', label: 'Linux', detail: 'Flatpak', match: /\.flatpak$/i }
+		'linux-appimage': { os: 'linux', label: 'Linux', detail: 'AppImage (x64)', match: /x86_64\.AppImage$/i },
+		'linux-appimage-arm64': {
+			os: 'linux',
+			label: 'Linux',
+			detail: 'AppImage (ARM64)',
+			match: /aarch64\.AppImage$/i
+		},
+		'linux-flatpak': { os: 'linux', label: 'Linux', detail: 'Flatpak (x64)', match: /\d\.flatpak$/i },
+		'linux-flatpak-arm64': {
+			os: 'linux',
+			label: 'Linux',
+			detail: 'Flatpak (ARM64)',
+			match: /aarch64\.flatpak$/i
+		}
 	};
+
+	// Chromium on Windows reports "x64" in the UA string even on ARM, so ask
+	// the high-entropy client hints when they exist.
+	async function isArm(): Promise<boolean> {
+		if (/aarch64|arm64|armv8/i.test(navigator.userAgent)) return true;
+		try {
+			const uaData = (navigator as any).userAgentData;
+			if (uaData?.getHighEntropyValues) {
+				const { architecture } = await uaData.getHighEntropyValues(['architecture']);
+				return architecture === 'arm';
+			}
+		} catch {}
+		return false;
+	}
 
 	let status = $state<'loading' | 'ready' | 'error' | 'mobile'>('loading');
 	let version = $state('');
@@ -39,13 +79,19 @@
 		return /Android|iPhone|iPad|iPod/i.test(ua);
 	}
 
-	function detectPlatform(): Platform {
+	async function detectPlatform(): Promise<Platform> {
 		const ua = navigator.userAgent;
-		if (/Windows/i.test(ua)) return 'windows';
-		if (/Linux/i.test(ua) && !/Android/i.test(ua)) return 'linux-appimage';
 		if (/Macintosh|Mac OS X/i.test(ua)) return 'macos-arm64';
-		return 'linux-appimage';
+		const arm = await isArm();
+		if (/Windows/i.test(ua)) return arm ? 'windows-arm64' : 'windows';
+		return arm ? 'linux-appimage-arm64' : 'linux-appimage';
 	}
+
+	// Older releases have no ARM builds; offer the x64 one rather than nothing.
+	const ARM_FALLBACK: Partial<Record<Platform, Platform>> = {
+		'windows-arm64': 'windows',
+		'linux-appimage-arm64': 'linux-appimage'
+	};
 
 	function assetFor(platform: Platform): Asset | undefined {
 		return assets.find((a) => PLATFORM_META[platform].match.test(a.name));
@@ -68,17 +114,19 @@
 			return;
 		}
 
-		detected = detectPlatform();
-
-		fetch(`https://api.github.com/repos/${REPO}/releases/latest`)
-			.then((res) => {
+		Promise.all([
+			detectPlatform(),
+			fetch(`https://api.github.com/repos/${REPO}/releases/latest`).then((res) => {
 				if (!res.ok) throw new Error(`GitHub API ${res.status}`);
 				return res.json();
 			})
-			.then((data) => {
+		])
+			.then(([platform, data]) => {
 				version = data.tag_name?.replace(/^v/, '') ?? '';
 				publishedAt = data.published_at ?? '';
 				assets = data.assets ?? [];
+				const fallback = ARM_FALLBACK[platform];
+				detected = !assetFor(platform) && fallback ? fallback : platform;
 				status = 'ready';
 			})
 			.catch(() => {
@@ -88,10 +136,13 @@
 
 	const orderedPlatforms: Platform[] = [
 		'windows',
+		'windows-arm64',
 		'macos-arm64',
 		'macos-x64',
 		'linux-appimage',
-		'linux-flatpak'
+		'linux-appimage-arm64',
+		'linux-flatpak',
+		'linux-flatpak-arm64'
 	];
 
 	const primary = $derived(detected ? assetFor(detected) : undefined);
